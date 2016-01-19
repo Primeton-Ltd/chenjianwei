@@ -1,0 +1,82 @@
+通过监测发现CPU占用率超高
+
+使用top -eosadmin命令查看当前用户的进程，发现java进程占用CPU较高，java进程id为28694
+
+使用top命令加参数查看java进程中的线程列表，发现有较多的线程分摊了CPU的使用，每个线程占用CPU的比例超过25%，这样的线程有30个，命令为：top -Hp 28694
+注：服务器的CPU个数为8
+
+先通过jstack命令将当前的java线程栈输出到指定目录
+jstack 28694 >/eosdata/dump/dump20160112.dump
+
+同时找到其中一个占用CPU较高的java线程pid，这里的pid=522，在线程栈中查找线程名称；
+由于线程id是以16进制显示，所以需要转化，执行命令：printf "%x\n" 522，对应的16进制：20a
+
+再通过命令获取线程名称，执行命令：jstack 28694|grep 20a，获取的线程信息如下：
+"http-bio-8080-exec-725" daemon prio=10 tid=0x00007f296849d000 nid=0x20a runnable [0x00007f28d90cd000]  - locked <0x0000000705420a48> (a com.mchange.v2.c3p0.impl.NewPooledConnection) 
+
+通过编辑器或者jca打开导出的dump文件，找到对应的线程栈如下：
+"http-bio-8080-exec-725" daemon prio=10 tid=0x00007f296849d000 nid=0x20a runnable [0x00007f28d90cd000]
+   java.lang.Thread.State: RUNNABLE
+ at java.net.PlainSocketImpl.socketAvailable(Native Method)
+ at java.net.PlainSocketImpl.available(PlainSocketImpl.java:472)
+ - locked <0x00000007073fa488> (a java.net.SocksSocketImpl)
+ at java.net.SocketInputStream.available(SocketInputStream.java:217)
+ at com.mysql.jdbc.util.ReadAheadInputStream.fill(ReadAheadInputStream.java:71)
+ at com.mysql.jdbc.util.ReadAheadInputStream.skip(ReadAheadInputStream.java:299)
+ at com.mysql.jdbc.MysqlIO.clearInputStream(MysqlIO.java:800)
+ at com.mysql.jdbc.MysqlIO.sendCommand(MysqlIO.java:1506)
+ at com.mysql.jdbc.MysqlIO.sqlQueryDirect(MysqlIO.java:1666)
+ at com.mysql.jdbc.Connection.execSQL(Connection.java:2988)
+ - locked <0x00000007073d6f68> (a java.lang.Object)
+ at com.mysql.jdbc.Connection.execSQL(Connection.java:2917)
+ at com.mysql.jdbc.Statement.executeQuery(Statement.java:824)
+ - locked <0x00000007073d6f68> (a java.lang.Object)
+ - locked <0x00000007245aca98> (a com.mysql.jdbc.Statement)
+ at com.mysql.jdbc.DatabaseMetaData$9.forEach(DatabaseMetaData.java:4453)
+ at com.mysql.jdbc.DatabaseMetaData$IterateBlock.doForAll(DatabaseMetaData.java:79)
+ at com.mysql.jdbc.DatabaseMetaData.getTables(DatabaseMetaData.java:4440)
+ at com.mchange.v2.c3p0.impl.DefaultConnectionTester.activeCheckConnection(DefaultConnectionTester.java:104)
+ at com.mchange.v2.c3p0.impl.DefaultConnectionTester.statusOnException(DefaultConnectionTester.java:77)
+ at com.mchange.v2.c3p0.impl.DefaultConnectionTester.statusOnException(DefaultConnectionTester.java:56)
+ at com.mchange.v2.c3p0.impl.NewPooledConnection.handleThrowable(NewPooledConnection.java:299)
+ - locked <0x000000070613b618> (a com.mchange.v2.c3p0.impl.NewPooledConnection)
+ at com.mchange.v2.c3p0.impl.NewProxyPreparedStatement.executeQuery(NewProxyPreparedStatement.java:93)
+...
+发现该线程一直停在 java.net.PlainSocketImpl.socketAvailable(Native Method)，是一个Native方
+
+在百度中搜索 java.net.PlainSocketImpl.socketAvailable(Native Method)，参考答复如下：
+“这是因为Mysql服务器已经把链接断开了，而本机仍在一直等待，未设定超时机制不停的等待。”
+解决办法：
+在Mysql执行时设定超时，包括connectTimeOut和socketTimeOut。
+jdbc:mysql://xxx:6446/xxx?autoReconnect=true&connectTimeout=60000&socketTimeout=60000
+同时，有人贴出了mysql的bug描述，bug的id为73053
+http://bugs.mysql.com/bug.php?id=73053，
+
+接着在百度中搜索mysql bugs 73053,结果与上述一致，如下是该缺陷的相关描述：
+Linux kernels version 3.6 and earlier (including 2.6.32) have a bug [1] which makes requests for the amount of available bytes to read in a socket in CLOSE_WAIT state to return 1 even after the EOF has been read.
+
+This bug makes SocketInputStream.available return 1 for sockets in CLOSE_WAIT state and causes a seemly infinite loop in MysqlIO.clearInputStream where it attempts to read from the socket until the number of available bytes reaches 0, but there is nothing to read
+Java strack trace of a thread looping in clearInputStream:
+
+   java.lang.Thread.State: RUNNABLE
+        at java.net.PlainSocketImpl.socketAvailable(Native Method)
+        at java.net.PlainSocketImpl.available(PlainSocketImpl.java:472)
+        - locked <0x00007f674094a498> (a java.net.SocksSocketImpl)
+        at java.net.SocketInputStream.available(SocketInputStream.java:217)
+        at com.mysql.jdbc.util.ReadAheadInputStream.available(ReadAheadInputStream.java:232)
+        at com.mysql.jdbc.MysqlIO.clearInputStream(MysqlIO.java:961)
+        at com.mysql.jdbc.ServerPreparedStatement.serverPrepare(ServerPreparedStatement.java:1690)
+        - locked <0x00007f672c938970> (a java.lang.Object)
+        at com.mysql.jdbc.ServerPreparedStatement.<init>(ServerPreparedStatement.java:427)
+        at com.mysql.jdbc.JDBC4ServerPreparedStatement.<init>(JDBC4ServerPreparedStatement.java:44)
+        [reset omitted]
+同时，提供了解决该缺陷的办法，参考URL:
+https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=a3374c4
+看了后不太明白内核的修改方案，但基本确定就是因为mysql的这个缺陷导致了应用服务器的CPU占用100%；
+这里尝试另外一种解决办法，如上述案例中提到的，即：
+在Mysql执行时设定超时，包括connectTimeOut和socketTimeOut。
+jdbc:mysql://xxx:6446/xxx?autoReconnect=true&connectTimeout=60000&socketTimeout=60000
+
+参考案例：
+http://blog.chinaunix.net/uid-24648266-id-5594714.html
+
